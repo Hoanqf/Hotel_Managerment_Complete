@@ -1,0 +1,317 @@
+import prisma from "../config/prisma";
+import { Prisma } from "@prisma/client";
+import { BookingPolicyService, HOLDING_BOOKING_STATUSES } from "./booking-policy.service";
+
+// Hàm làm sạch roomTypeId từ frontend (ví dụ "rt-1" -> 1)
+const cleanRoomTypeId = (typeId: string | number): bigint => {
+  if (typeof typeId === "string") {
+    const clean = typeId.replace("rt-", "");
+    return BigInt(clean);
+  }
+  return BigInt(typeId);
+};
+
+export const RoomService = {
+  // 1. Lấy danh sách phòng (kèm theo đặt phòng đang checked-in và bảo trì đang diễn ra)
+  getAllRooms: async () => {
+    await BookingPolicyService.syncNoShowsIfDue();
+    const rooms = await prisma.room.findMany({
+      include: {
+        roomType: true,
+        // Lấy toàn bộ lịch sử để Timeline có thể xem cả quá khứ và tương lai.
+        // Trạng thái vận hành hiện tại sẽ được lọc riêng ở phía dưới.
+        bookings: {
+          include: {
+            invoice: { include: { payments: true } },
+            bookingServices: { include: { service: true } },
+          },
+          orderBy: {
+            checkInDate: "asc"
+          }
+        },
+        // Lấy thông tin bảo trì đang hoạt động
+        maintenance: {
+          where: {
+            status: {
+              in: ["IN_PROGRESS", "WAITING_PARTS", "PENDING"]
+            }
+          },
+          take: 1
+        }
+      },
+      orderBy: {
+        roomNumber: "asc",
+      },
+    });
+
+    const now = new Date();
+
+    return rooms.map(room => {
+      // CHECKED_IN là trạng thái vận hành thực tế. Nếu chưa check-in, chỉ coi
+      // booking là hiện hành khi thời điểm đang xem nằm trong [check-in, check-out).
+      // Booking tương lai tuyệt đối không làm Room Map hiện tại thành RESERVED.
+      let activeBooking = room.bookings.find(b =>
+        b.status === "CHECKED_IN" ||
+        (b.status === "NO_SHOW" && new Date(b.checkOutDate) > now)
+      );
+
+      // Điều kiện nửa mở cũng đảm bảo booking kế tiếp bắt đầu đúng lúc booking
+      // trước trả phòng không bị coi là trùng.
+      if (!activeBooking) {
+        activeBooking = room.bookings.find(b => {
+          const checkIn = new Date(b.checkInDate);
+          const checkOut = new Date(b.checkOutDate);
+          return HOLDING_BOOKING_STATUSES.includes(b.status) && checkIn <= now && now < checkOut;
+        });
+      }
+
+      const serializeBooking = (b: typeof room.bookings[number]) => ({
+        ...b,
+        id: b.id.toString(),
+        roomId: b.roomId.toString(),
+        userId: b.userId ? b.userId.toString() : null,
+        customerId: b.customerId ? b.customerId.toString() : null,
+        totalAmount: Number(b.totalAmount),
+        paymentStatus: b.invoice?.status === "PAID" ||
+          Number(b.invoice?.payments.reduce((sum, payment) => sum + Number(payment.amount), 0) || 0) >= Number(b.invoice?.totalAmount || b.totalAmount)
+            ? "PAID"
+            : "UNPAID",
+        invoice: b.invoice ? {
+          ...b.invoice,
+          id: b.invoice.id.toString(),
+          bookingId: b.invoice.bookingId.toString(),
+          subTotal: Number(b.invoice.subTotal),
+          taxAmount: Number(b.invoice.taxAmount),
+          discount: Number(b.invoice.discount),
+          totalAmount: Number(b.invoice.totalAmount),
+          payments: b.invoice.payments.map(payment => ({
+            ...payment,
+            id: payment.id.toString(),
+            invoiceId: payment.invoiceId.toString(),
+            amount: Number(payment.amount),
+          })),
+        } : null,
+        bookingServices: b.bookingServices.map(item => ({
+          ...item,
+          id: item.id.toString(),
+          bookingId: item.bookingId.toString(),
+          serviceId: item.serviceId.toString(),
+          price: Number(item.price),
+          totalAmount: Number(item.totalAmount),
+          service: { ...item.service, id: item.service.id.toString(), price: Number(item.service.price) },
+        })),
+      });
+
+      return {
+        ...room,
+        // RESERVED/BOOKED là trạng thái lịch được tính động, không phải trạng
+        // thái vận hành được lưu lâu dài trên bản ghi phòng.
+        status: ["RESERVED", "BOOKED"].includes(room.status) ? "AVAILABLE" : room.status,
+        id: room.id.toString(),
+        roomTypeId: `rt-${room.roomTypeId.toString()}`, // Định dạng lại giống mock frontend ("rt-1")
+        amenities: room.amenities || [], // Tiện nghi riêng biệt của phòng
+        pricePerNight: room.pricePerNight !== null ? Number(room.pricePerNight) : Number(room.roomType.pricePerNight),
+        capacity: room.capacity !== null && room.capacity !== undefined ? room.capacity : room.roomType.capacity,
+        roomType: {
+          ...room.roomType,
+          id: `rt-${room.roomType.id.toString()}`,
+          pricePerNight: Number(room.roomType.pricePerNight),
+          priceHourly: Number(room.roomType.priceHourly || 0),
+          priceDaily: Number(room.roomType.priceDaily || 0),
+          priceOvernight: Number(room.roomType.priceOvernight || 0),
+          priceHourlyWeekend: Number(room.roomType.priceHourlyWeekend || 0),
+          priceDailyWeekend: Number(room.roomType.priceDailyWeekend || 0),
+          priceOvernightWeekend: Number(room.roomType.priceOvernightWeekend || 0),
+          priceHourlyHoliday: Number(room.roomType.priceHourlyHoliday || 0),
+          priceDailyHoliday: Number(room.roomType.priceDailyHoliday || 0),
+          priceOvernightHoliday: Number(room.roomType.priceOvernightHoliday || 0),
+          amenities: room.roomType.amenities || []
+        },
+        // `bookings` chỉ chứa booking vận hành hiện tại; `calendarBookings`
+        // chứa đầy đủ cả CHECKED_OUT/COMPLETED để Timeline xem lại lịch sử.
+        bookings: activeBooking ? [serializeBooking(activeBooking)] : [],
+        calendarBookings: room.bookings.map(serializeBooking),
+        currentBooking: activeBooking ? serializeBooking(activeBooking) : null,
+        maintenance: room.maintenance.map(m => ({
+          ...m,
+          id: m.id.toString(),
+          roomId: m.roomId.toString(),
+          staffId: m.staffId ? m.staffId.toString() : null,
+        }))
+      };
+    });
+  },
+
+  // 1.5. Lấy danh sách loại phòng từ database
+  getRoomTypes: async () => {
+    const roomTypes = await prisma.roomType.findMany({
+      orderBy: { id: "asc" }
+    });
+    return roomTypes.map(rt => ({
+      ...rt,
+      id: `rt-${rt.id.toString()}`,
+      pricePerNight: Number(rt.pricePerNight),
+      priceHourly: Number(rt.priceHourly || 0),
+      priceDaily: Number(rt.priceDaily || 0),
+      priceOvernight: Number(rt.priceOvernight || 0),
+      priceHourlyWeekend: Number(rt.priceHourlyWeekend || 0),
+      priceDailyWeekend: Number(rt.priceDailyWeekend || 0),
+      priceOvernightWeekend: Number(rt.priceOvernightWeekend || 0),
+      priceHourlyHoliday: Number(rt.priceHourlyHoliday || 0),
+      priceDailyHoliday: Number(rt.priceDailyHoliday || 0),
+      priceOvernightHoliday: Number(rt.priceOvernightHoliday || 0),
+      amenities: rt.amenities || []
+    }));
+  },
+
+  updateRoomTypePricing: async (id: string, data: any) => {
+    const roomTypeId = cleanRoomTypeId(id);
+    const fields = [
+      "priceHourly", "priceDaily", "priceOvernight",
+      "priceHourlyWeekend", "priceDailyWeekend", "priceOvernightWeekend",
+      "priceHourlyHoliday", "priceDailyHoliday", "priceOvernightHoliday",
+    ] as const;
+    const prices = Object.fromEntries(fields.map(field => [field, Number(data[field] ?? 0)]));
+    if (Object.values(prices).some(value => !Number.isFinite(value) || value < 0)) {
+      throw new Error("Mức giá không hợp lệ");
+    }
+    const updated = await prisma.roomType.update({
+      where: { id: roomTypeId },
+      data: {
+        pricePerNight: new Prisma.Decimal(prices.priceDaily),
+        ...Object.fromEntries(fields.map(field => [field, new Prisma.Decimal(prices[field])])),
+      },
+    });
+    return {
+      ...updated,
+      id: `rt-${updated.id}`,
+      pricePerNight: Number(updated.pricePerNight),
+      ...Object.fromEntries(fields.map(field => [field, Number(updated[field])])),
+    };
+  },
+
+  // Chỉ cập nhật trạng thái vận hành; không đụng tới loại phòng, giá hay booking.
+  updateOperationalStatus: async (id: string, status: string) => {
+    const cleanId = BigInt(id.replace("r-", ""));
+    const updated = await prisma.room.update({ where: { id: cleanId }, data: { status } });
+    return { ...updated, id: updated.id.toString(), roomTypeId: `rt-${updated.roomTypeId.toString()}` };
+  },
+
+  // 2. Tạo phòng mới
+  createRoom: async (data: any) => {
+    const roomTypeIdClean = cleanRoomTypeId(data.roomTypeId);
+
+    const newRoom = await prisma.room.create({
+      data: {
+        roomNumber: data.roomNumber,
+        floor: Number(data.floor),
+        status: data.status || "AVAILABLE",
+        roomTypeId: roomTypeIdClean,
+        note: data.note || "",
+        amenities: data.amenities || [], // Lưu tiện nghi riêng vào phòng
+        pricePerNight: data.pricePerNight ? new Prisma.Decimal(Number(data.pricePerNight)) : null, // Lưu giá riêng vào phòng
+        capacity: data.maxGuests ? Number(data.maxGuests) : null // Lưu công suất riêng vào phòng
+      },
+      include: {
+        roomType: true
+      }
+    });
+
+    return {
+      ...newRoom,
+      id: newRoom.id.toString(),
+      roomTypeId: `rt-${newRoom.roomTypeId.toString()}`,
+      amenities: newRoom.amenities || [], // Tiện nghi của phòng
+      pricePerNight: newRoom.pricePerNight !== null ? Number(newRoom.pricePerNight) : Number(newRoom.roomType.pricePerNight),
+      capacity: newRoom.capacity !== null && newRoom.capacity !== undefined ? newRoom.capacity : newRoom.roomType.capacity,
+      roomType: {
+        ...newRoom.roomType,
+        id: `rt-${newRoom.roomType.id.toString()}`,
+        pricePerNight: Number(newRoom.roomType.pricePerNight),
+        amenities: newRoom.roomType.amenities || []
+      }
+    };
+  },
+
+  // 3. Cập nhật phòng
+  updateRoom: async (id: string, data: any) => {
+    const cleanId = BigInt(id.replace("r-", "")); // Làm sạch room ID nếu frontend gửi "r-101"
+    const roomTypeIdClean = cleanRoomTypeId(data.roomTypeId);
+
+    const updatedRoom = await prisma.room.update({
+      where: { id: cleanId },
+      data: {
+        roomNumber: data.roomNumber,
+        floor: Number(data.floor),
+        status: data.status,
+        roomTypeId: roomTypeIdClean,
+        note: data.note || "",
+        amenities: data.amenities || [], // Lưu tiện nghi riêng vào phòng
+        pricePerNight: data.pricePerNight ? new Prisma.Decimal(Number(data.pricePerNight)) : null, // Lưu giá riêng vào phòng
+        capacity: data.maxGuests ? Number(data.maxGuests) : null // Lưu công suất riêng vào phòng
+      },
+      include: {
+        roomType: true
+      }
+    });
+
+    return {
+      ...updatedRoom,
+      id: updatedRoom.id.toString(),
+      roomTypeId: `rt-${updatedRoom.roomTypeId.toString()}`,
+      amenities: updatedRoom.amenities || [], // Tiện nghi của phòng
+      pricePerNight: updatedRoom.pricePerNight !== null ? Number(updatedRoom.pricePerNight) : Number(updatedRoom.roomType.pricePerNight),
+      capacity: updatedRoom.capacity !== null && updatedRoom.capacity !== undefined ? updatedRoom.capacity : updatedRoom.roomType.capacity,
+      roomType: {
+        ...updatedRoom.roomType,
+        id: `rt-${updatedRoom.roomType.id.toString()}`,
+        pricePerNight: Number(updatedRoom.roomType.pricePerNight),
+        amenities: updatedRoom.roomType.amenities || []
+      }
+    };
+  },
+
+  // 4. Xóa phòng
+  deleteRoom: async (id: string) => {
+    const cleanId = BigInt(id.replace("r-", ""));
+
+    // Một booking có thể có hóa đơn và các khoản thanh toán. Các bản ghi này
+    // phải được xóa trước booking, nếu không cơ sở dữ liệu sẽ chặn thao tác
+    // xóa phòng do ràng buộc khóa ngoại.
+    const deletedRoom = await prisma.$transaction(async (tx) => {
+      const bookings = await tx.booking.findMany({
+        where: { roomId: cleanId },
+        select: { id: true }
+      });
+      const bookingIds = bookings.map((booking) => booking.id);
+
+      await tx.maintenanceRecord.deleteMany({
+        where: { roomId: cleanId }
+      });
+
+      if (bookingIds.length > 0) {
+        await tx.payment.deleteMany({
+          where: { invoice: { bookingId: { in: bookingIds } } }
+        });
+        await tx.invoice.deleteMany({
+          where: { bookingId: { in: bookingIds } }
+        });
+        await tx.bookingService.deleteMany({
+          where: { bookingId: { in: bookingIds } }
+        });
+        await tx.booking.deleteMany({
+          where: { id: { in: bookingIds } }
+        });
+      }
+
+      return tx.room.delete({
+        where: { id: cleanId }
+      });
+    });
+
+    return {
+      ...deletedRoom,
+      id: deletedRoom.id.toString()
+    };
+  }
+};
